@@ -26,6 +26,7 @@ import (
 	"github.com/travis-ci/worker/context"
 	"github.com/travis-ci/worker/image"
 	"github.com/travis-ci/worker/metrics"
+	"github.com/travis-ci/worker/ratelimit"
 	"golang.org/x/crypto/ssh"
 	gocontext "golang.org/x/net/context"
 	"golang.org/x/oauth2"
@@ -50,7 +51,8 @@ const (
 	defaultGCEHardTimeoutMinutes = int64(130)
 	defaultGCEImageSelectorType  = "env"
 	defaultGCEImage              = "travis-ci-mega.+"
-	defaultGCERateLimitTick      = 1 * time.Second
+	defaultGCERateLimitMaxCalls  = 10
+	defaultGCERateLimitDuration  = time.Second
 )
 
 var (
@@ -116,11 +118,19 @@ var (
 			"PREMIUM_MACHINE_TYPE", "Premium machine type"),
 		backendStringFlag("gce", "project-id", "",
 			"PROJECT_ID", "Project id"),
+		backendStringFlag("gce", "rate-limit-prefix", "", "RATE_LIMIT_PREFIX", "Prefix for rate limit key in Redis"),
+		backendStringFlag("gce", "rate-limit-redis-url", "", "RATE_LIMIT_REDIS_URL", "URL to Redis instance to use for rate limiting"),
+		&cli.IntFlag{
+			Name:   "rate-limit-max-calls",
+			Value:  defaultGCERateLimitMaxCalls,
+			Usage:  "Number of calls per duration to let through to the GCE API",
+			EnvVar: beEnv("gce", "RATE_LIMIT_MAX_CALLS"),
+		},
 		&cli.DurationFlag{
-			Name:   "rate-limit-tick",
-			Value:  defaultGCERateLimitTick,
-			Usage:  "Duration to wait between GCE API calls",
-			EnvVar: beEnv("gce", "RATE_LIMIT_TICK"),
+			Name:   "rate-limit-duration",
+			Value:  defaultGCERateLimitDuration,
+			Usage:  "Interval in which to let max-calls calls through to the GCE API",
+			EnvVar: beEnv("gce", "RATE_LIMIT_DURATION"),
 		},
 		&cli.BoolFlag{
 			Name:   "skip-stop-poll",
@@ -212,7 +222,9 @@ type gceProvider struct {
 	uploadRetries     uint64
 	uploadRetrySleep  time.Duration
 
-	rateLimiter         *time.Ticker
+	rateLimiter         ratelimit.RateLimiter
+	rateLimitMaxCalls   uint64
+	rateLimitDuration   time.Duration
 	rateLimitQueueDepth uint64
 }
 
@@ -335,6 +347,11 @@ func newGCEProvider(c ConfigGetter) (Provider, error) {
 		return nil, err
 	}
 
+	redisConn, err := redis.DialURL(c.String("rate-limit-redis-url"))
+	if err != nil {
+		return nil, err
+	}
+
 	return &gceProvider{
 		client:    client,
 		projectID: c.String("project-id"),
@@ -364,18 +381,30 @@ func newGCEProvider(c ConfigGetter) (Provider, error) {
 		uploadRetries:     uint64(c.Int("upload-retries")),
 		uploadRetrySleep:  c.Duration("upload-retry-sleep"),
 
-		rateLimiter: time.NewTicker(c.Duration("rate-limit-tick")),
+		rateLimiter:       ratelimit.NewRateLimiter(redisConn, c.String("rate-limit-prefix")),
+		rateLimitMaxCalls: uint64(c.Int("rate-limit-max-calls")),
+		rateLimitDuration: c.Duration("rate-limit-duration"),
 	}, nil
 }
 
 func (p *gceProvider) apiRateLimit() {
-	atomic.AddUint64(&p.rateLimitQueueDepth, 1)
 	metrics.Gauge("travis.worker.vm.provider.gce.rate-limit.queue", int64(p.rateLimitQueueDepth))
 	startWait := time.Now()
-	<-p.rateLimiter.C
-	metrics.TimeSince("travis.worker.vm.provider.gce.rate-limit", startWait)
+	defer metrics.TimeSince("travis.worker.vm.provider.gce.rate-limit", startWait)
+
+	atomic.AddUint64(&p.rateLimitQueueDepth, 1)
 	// This decrements the counter, see the docs for atomic.AddUint64
-	atomic.AddUint64(&p.rateLimitQueueDepth, ^uint64(0))
+	defer atomic.AddUint64(&p.rateLimitQueueDepth, ^uint64(0))
+
+	for {
+		ok, err := p.rateLimiter.RateLimit("gce-api", p.rateLimitMaxCalls, p.RateLimitDuration)
+		if ok {
+			return
+		}
+
+		// Sleep for up to 1 second
+		time.Sleep(time.Millisecond * time.Duration(rand.Intn(1000)))
+	}
 }
 
 func (p *gceProvider) Setup() error {
