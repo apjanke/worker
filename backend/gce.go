@@ -397,7 +397,7 @@ func (p *gceProvider) apiRateLimit() {
 	defer atomic.AddUint64(&p.rateLimitQueueDepth, ^uint64(0))
 
 	for {
-		ok, err := p.rateLimiter.RateLimit("gce-api", p.rateLimitMaxCalls, p.RateLimitDuration)
+		ok, _ := p.rateLimiter.RateLimit("gce-api", p.rateLimitMaxCalls, p.RateLimitDuration)
 		if ok {
 			return
 		}
